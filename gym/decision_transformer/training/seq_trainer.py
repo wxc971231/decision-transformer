@@ -8,6 +8,16 @@ class SequenceTrainer(Trainer):
 
     def train_step(self):
         states, actions, rewards, dones, rtg, timesteps, attention_mask = self.get_batch(self.batch_size)
+        '''
+        states:         (batch_size, max_len, state_dim)
+        actions:        (batch_size, max_len, act_dim)
+        rewards:        (batch_size, max_len, 1)
+        rtgs:           (batch_size, max_len+1, 1)
+        dones:          (batch_size, max_len, )
+        timesteps:      (batch_size, max_len, ) 这是所有 token 的绝对 timestep
+        attention_mask: (batch_size, max_len, )
+        '''
+
         action_target = torch.clone(actions)
 
         state_preds, action_preds, reward_preds = self.model.forward(

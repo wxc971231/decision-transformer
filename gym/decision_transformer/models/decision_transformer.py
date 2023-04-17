@@ -52,18 +52,25 @@ class DecisionTransformer(TrajectoryModel):
         self.predict_return = torch.nn.Linear(hidden_size, 1)
 
     def forward(self, states, actions, rewards, returns_to_go, timesteps, attention_mask=None):
-
+        '''
+        states:         (batch_size, seq_length, state_dim)
+        actions:        (batch_size, seq_length, act_dim)
+        rewards:        (batch_size, seq_length, 1)
+        returns_to_go:  (batch_size, seq_length, 1)
+        timesteps:      (batch_size, seq_length, ) 这是所有 token 的绝对 timestep
+        attention_mask: (batch_size, seq_length, )
+        '''
         batch_size, seq_length = states.shape[0], states.shape[1]
 
+        # attention_mask is None 则所有 token 都可以被关注（后面算 attn 时还会再应用下三角）
         if attention_mask is None:
-            # attention mask for GPT: 1 if can be attended to, 0 if not
-            attention_mask = torch.ones((batch_size, seq_length), dtype=torch.long)
+            attention_mask = torch.ones((batch_size, seq_length), dtype=torch.long) # 1 if can be attended to; 0 if not
 
         # embed each modality with a different head
-        state_embeddings = self.embed_state(states)
-        action_embeddings = self.embed_action(actions)
-        returns_embeddings = self.embed_return(returns_to_go)
-        time_embeddings = self.embed_timestep(timesteps)
+        state_embeddings = self.embed_state(states)             # (batch_size, seq_length, hidden_size)
+        action_embeddings = self.embed_action(actions)          # (batch_size, seq_length, hidden_size)
+        returns_embeddings = self.embed_return(returns_to_go)   # (batch_size, seq_length, hidden_size)
+        time_embeddings = self.embed_timestep(timesteps)        # (batch_size, seq_length, hidden_size)
 
         # time embeddings are treated similar to positional embeddings
         state_embeddings = state_embeddings + time_embeddings
@@ -72,15 +79,17 @@ class DecisionTransformer(TrajectoryModel):
 
         # this makes the sequence look like (R_1, s_1, a_1, R_2, s_2, a_2, ...)
         # which works nice in an autoregressive sense since states predict actions
-        stacked_inputs = torch.stack(
-            (returns_embeddings, state_embeddings, action_embeddings), dim=1
-        ).permute(0, 2, 1, 3).reshape(batch_size, 3*seq_length, self.hidden_size)
-        stacked_inputs = self.embed_ln(stacked_inputs)
+        stacked_inputs = torch.stack((returns_embeddings, state_embeddings, action_embeddings), dim=1)  # (batch_size, 3, seq_length, hidden_size)
+        stacked_inputs = stacked_inputs.permute(0, 2, 1, 3)                                             # (batch_size, seq_length, 3, hidden_size)
+        stacked_inputs = stacked_inputs.reshape(batch_size, 3*seq_length, self.hidden_size)             # (batch_size, 3*seq_length, hidden_size)
+        
+        # LayerNorm
+        stacked_inputs = self.embed_ln(stacked_inputs)  # (batch_size, 3*seq_length, hidden_size)
 
         # to make the attention mask fit the stacked inputs, have to stack it as well
-        stacked_attention_mask = torch.stack(
-            (attention_mask, attention_mask, attention_mask), dim=1
-        ).permute(0, 2, 1).reshape(batch_size, 3*seq_length)
+        stacked_attention_mask = torch.stack((attention_mask, attention_mask, attention_mask), dim=1)   # (batch_size, 3, seq_length)
+        stacked_attention_mask = stacked_attention_mask.permute(0, 2, 1)                                # (batch_size, seq_length, 3)
+        stacked_attention_mask = stacked_attention_mask.reshape(batch_size, 3*seq_length)               # (batch_size, 3*seq_length, )
 
         # we feed in the input embeddings (not word indices as in NLP) to the model
         transformer_outputs = self.transformer(
@@ -109,12 +118,13 @@ class DecisionTransformer(TrajectoryModel):
         timesteps = timesteps.reshape(1, -1)
 
         if self.max_length is not None:
+            # 保留序列最后的 self.max_length 长度
             states = states[:,-self.max_length:]
             actions = actions[:,-self.max_length:]
             returns_to_go = returns_to_go[:,-self.max_length:]
             timesteps = timesteps[:,-self.max_length:]
 
-            # pad all tokens to sequence length
+            # 如果各序列长度不足，pad all tokens to sequence length
             attention_mask = torch.cat([torch.zeros(self.max_length-states.shape[1]), torch.ones(states.shape[1])])
             attention_mask = attention_mask.to(dtype=torch.long, device=states.device).reshape(1, -1)
             states = torch.cat(

@@ -15,7 +15,6 @@ from collections import deque
 import random
 import torch
 import pickle
-import blosc
 import argparse
 from create_dataset import create_dataset
 
@@ -24,7 +23,8 @@ parser.add_argument('--seed', type=int, default=123)
 parser.add_argument('--context_length', type=int, default=30)
 parser.add_argument('--epochs', type=int, default=5)
 parser.add_argument('--model_type', type=str, default='reward_conditioned')
-parser.add_argument('--num_steps', type=int, default=500000)
+#parser.add_argument('--num_steps', type=int, default=500000)
+parser.add_argument('--num_steps', type=int, default=1000)
 parser.add_argument('--num_buffers', type=int, default=50)
 parser.add_argument('--game', type=str, default='Breakout')
 parser.add_argument('--batch_size', type=int, default=128)

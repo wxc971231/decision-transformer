@@ -15,7 +15,6 @@ from collections import deque
 import random
 import torch
 import pickle
-import blosc
 import argparse
 from fixed_replay_buffer import FixedReplayBuffer
 
@@ -34,7 +33,7 @@ def create_dataset(num_buffers, num_steps, game, data_dir_prefix, trajectories_p
         i = transitions_per_buffer[buffer_num]
         print('loading from buffer %d which has %d already loaded' % (buffer_num, i))
         frb = FixedReplayBuffer(
-            data_dir=data_dir_prefix + game + '/1/replay_logs',
+            data_dir='/home/tim/桌面/git/decision-transformer/atari' + data_dir_prefix + game + '/1/replay_logs',
             replay_suffix=buffer_num,
             observation_shape=(84, 84),
             stack_size=4,

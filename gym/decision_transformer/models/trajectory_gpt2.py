@@ -119,32 +119,47 @@ def load_tf_weights_in_gpt2(model, config, gpt2_checkpoint_path):
 
 class Attention(nn.Module):
     def __init__(self, nx, n_ctx, config, scale=False, is_cross_attention=False):
+        '''
+        nx:     token 嵌入维数 hidden_size
+        n_ctx:  attention mask 的维数, 通常为 maximum sequence length
+        config: 模型配置信息
+        scale:  是否对注意力分数进行缩放以避免梯度消失或爆炸问题
+        is_cross_attention: 是否为 cross_attention
+        '''
         super().__init__()
 
-        n_state = nx  # in Attention: n_state=768 (nx=n_embd)
         # [switch nx => n_state from Block to Attention to keep identical to TF implem]
-        assert n_state % config.n_head == 0
-        self.register_buffer(
-            "bias", torch.tril(torch.ones((n_ctx, n_ctx), dtype=torch.uint8)).view(1, 1, n_ctx, n_ctx)
-        )
+        self.split_size = n_state = nx      # hidden_size
+        assert n_state % config.n_head == 0 # head_size = hidden_size // n_head
+        
+        # 注册一个 bias 下三角矩阵，尺寸为 (1,1,n_ctx,n_ctx), 它指示了两个 n_ctx 长度序列元素间的关系，将被用作 causal mask
+        self.register_buffer("bias", torch.tril(torch.ones((n_ctx, n_ctx), dtype=torch.uint8)).view(1, 1, n_ctx, n_ctx))
         self.register_buffer("masked_bias", torch.tensor(-1e4))
+        
         self.n_head = config.n_head
-        self.split_size = n_state
         self.scale = scale
+        
+        assert is_cross_attention == False  # DT 不使用 cross_attention
         self.is_cross_attention = is_cross_attention
         if self.is_cross_attention:
             self.c_attn = Conv1D(2 * n_state, nx)
             self.q_attn = Conv1D(n_state, nx)
         else:
-            self.c_attn = Conv1D(3 * n_state, nx)
+            self.c_attn = Conv1D(3 * n_state, nx)   # c_attn 用于后面升维切出 qkv 矩阵（这个 transformer 库的 Conv1D 和 Linear 变换基本等价，这里做一个升维 ）
+            
         self.c_proj = Conv1D(n_state, nx)
         self.attn_dropout = nn.Dropout(config.attn_pdrop)
         self.resid_dropout = nn.Dropout(config.resid_pdrop)
-        self.pruned_heads = set()
+        self.pruned_heads = set()   # 已经剪枝的 attention heads
 
     def prune_heads(self, heads):
+        '''
+        attention head 剪枝，从 heads 中剪去 self.pruned_heads
+        '''
         if len(heads) == 0:
             return
+        
+        # 从 heads 中剪去 self.pruned_heads 中的头，返回剩下的 heads 及相应索引
         heads, index = find_pruneable_heads_and_indices(
             heads, self.n_head, self.split_size // self.n_head, self.pruned_heads
         )
@@ -160,16 +175,25 @@ class Attention(nn.Module):
         self.pruned_heads = self.pruned_heads.union(heads)
 
     def _attn(self, q, k, v, attention_mask=None, head_mask=None, output_attentions=False):
-        w = torch.matmul(q, k)
+        '''
+        q:                  (batch_size, n_head, 3*seq_length, head_features)
+        k:                  (batch_size, n_head, head_features, 3*seq_length)
+        v:                  (batch_size, n_head, 3*seq_length, head_features)
+        attention_mask:     (batch_size, 1, 1, 3*seq_length)
+        head_mask:          None
+        output_attentions:  False
+        '''
+        w = torch.matmul(q, k)  # (batch_size, n_head, 3*seq_length, 3*seq_length) 
         if self.scale:
-            w = w / (float(v.size(-1)) ** 0.5)
-        nd, ns = w.size(-2), w.size(-1)
+            w = w / (float(v.size(-1)) ** 0.5)  # 用根号 head_features 作为温度系数对注意力分数进行缩放，避免梯度消失或爆炸问题
+        nd, ns = w.size(-2), w.size(-1)         # 都是序列长度 3*seq_length
 
+        # 对 "normal" attention layer 施加 causal mask
         if not self.is_cross_attention:
-            # if only "normal" attention layer implements causal mask
             mask = self.bias[:, :, ns - nd: ns, :ns]
-            w = torch.where(mask.bool(), w, self.masked_bias.to(w.dtype))
+            w = torch.where(mask.bool(), w, self.masked_bias.to(w.dtype))   # (batch_size, n_head, 3*seq_length, 3*seq_length)    
 
+        # 施加 padding mask
         if attention_mask is not None:
             # Apply the attention mask
             w = w + attention_mask
@@ -177,27 +201,33 @@ class Attention(nn.Module):
         w = nn.Softmax(dim=-1)(w)
         w = self.attn_dropout(w)
 
-        # Mask heads if we want to
+        assert head_mask is None        # DT 中没有遮盖注意力头
         if head_mask is not None:
             w = w * head_mask
 
-        outputs = [torch.matmul(w, v)]
-        if output_attentions:
+        outputs = [torch.matmul(w, v)]  # (batch_size, n_head, 3*seq_length, head_features)
+        if output_attentions:           
             outputs.append(w)
         return outputs
 
     def merge_heads(self, x):
-        x = x.permute(0, 2, 1, 3).contiguous()
-        new_x_shape = x.size()[:-2] + (x.size(-2) * x.size(-1),)
+        '''
+        汇聚多头注意力结果 x: (batch_size, n_head, 3*seq_length, head_features)
+        '''
+        x = x.permute(0, 2, 1, 3).contiguous()                      # (batch_size, 3*seq_length, n_head, head_features)
+        new_x_shape = x.size()[:-2] + (x.size(-2) * x.size(-1),)    # (batch_size, 3*seq_length, n_head * head_features)
         return x.view(*new_x_shape)  # in Tensorflow implem: fct merge_states
 
     def split_heads(self, x, k=False):
-        new_x_shape = x.size()[:-1] + (self.n_head, x.size(-1) // self.n_head)
-        x = x.view(*new_x_shape)  # in Tensorflow implem: fct split_states
+        '''
+        将张量 x:(batch_size, 3*seq_length, hidden_size) 的嵌入维度按注意力头数量进行切分
+        '''
+        new_x_shape = x.size()[:-1] + (self.n_head, x.size(-1) // self.n_head)  # (batch_size, 3*seq_length, n_head, head_features)
+        x = x.view(*new_x_shape)            # (batch_size, 3*seq_length, n_head, head_features)
         if k:
-            return x.permute(0, 2, 3, 1)  # (batch, head, head_features, seq_length)
+            return x.permute(0, 2, 3, 1)    # (batch_size, n_head, head_features, 3*seq_length)
         else:
-            return x.permute(0, 2, 1, 3)  # (batch, head, seq_length, head_features)
+            return x.permute(0, 2, 1, 3)    # (batch_size, n_head, 3*seq_length, head_features)
 
     def forward(
             self,
@@ -209,7 +239,17 @@ class Attention(nn.Module):
             encoder_attention_mask=None,
             use_cache=False,
             output_attentions=False,
-    ):
+    ):  
+        '''
+        hidden_states:          (batch_size, 3*seq_length, hidden_size)
+        attention_mask:         (batch_size, 1, 1, 3*seq_length)
+        layer_past:             None
+        head_mask:              None
+        encoder_hidden_states:  None    (DT 没有 encoder 部分)
+        encoder_attention_mask: None    (DT 没有 encoder 部分)
+        output_attentions:      False   (这个应该是 encoder 输出来做 cross attn 的)
+        '''
+        assert encoder_hidden_states is None    # DT 没有 encoder 部分
         if encoder_hidden_states is not None:
             assert hasattr(
                 self, "q_attn"
@@ -218,29 +258,36 @@ class Attention(nn.Module):
             key, value = self.c_attn(encoder_hidden_states).split(self.split_size, dim=2)
             attention_mask = encoder_attention_mask
         else:
+            # .c_attn(hidden_states) 将 hidden_states 升维到 (batch_size, 3*seq_length, 3*hidden_size)
+            # .split(hidden_states)  将 hidden_states 切成 query, key, value 三个 (batch_size, 3*seq_length, hidden_size)
             query, key, value = self.c_attn(hidden_states).split(self.split_size, dim=2)
 
-        query = self.split_heads(query)
-        key = self.split_heads(key, k=True)
-        value = self.split_heads(value)
+        query = self.split_heads(query)     # (batch_size, n_head, 3*seq_length, head_features)
+        key = self.split_heads(key, k=True) # (batch_size, n_head, head_features, 3*seq_length)
+        value = self.split_heads(value)     # (batch_size, n_head, 3*seq_length, head_features)
+        
+        assert layer_past is None           # for DT
         if layer_past is not None:
             past_key, past_value = layer_past[0].transpose(-2, -1), layer_past[1]  # transpose back cf below
             key = torch.cat((past_key, key), dim=-1)
             value = torch.cat((past_value, value), dim=-2)
 
         if use_cache is True:
-            present = torch.stack((key.transpose(-2, -1), value))  # transpose to have same shapes for stacking
+            present = torch.stack((key.transpose(-2, -1), value))  # (2, batch_size, n_head, head_features, 3*seq_length)
         else:
             present = (None,)
 
+        # 注意力计算
         attn_outputs = self._attn(query, key, value, attention_mask, head_mask, output_attentions)
-        a = attn_outputs[0]
+        a = attn_outputs[0]         # (batch_size, n_head, 3*seq_length, head_features)
 
-        a = self.merge_heads(a)
-        a = self.c_proj(a)
+        # 多头注意力汇聚（拼接+线性变换）
+        a = self.merge_heads(a)     # (batch_size, 3*seq_length, n_head*head_features=hidden_size)
+        a = self.c_proj(a)          # (batch_size, 3*seq_length, hidden_size)
         a = self.resid_dropout(a)
 
-        outputs = [a, present] + attn_outputs[1:]
+        # 若设置了 output_attentions=True, 这里 attn_outputs[1:]= output_attentions]，但在 DT 中没有
+        outputs = [a, present] + attn_outputs[1:]   
         return outputs  # a, present, (attentions)
 
 
@@ -258,7 +305,6 @@ class MLP(nn.Module):
         h2 = self.c_proj(h)
         return self.dropout(h2)
 
-
 class AdapterMLP(nn.Module):
     def __init__(self, n_state, config):  # in MLP: n_state=3072 (4 * n_embd)
         super().__init__()
@@ -273,8 +319,10 @@ class AdapterMLP(nn.Module):
         h2 = self.c_proj(h)
         return self.dropout(h2)
 
-
 class Block(nn.Module):
+    '''
+    GPT2 的 Block 中，在 Multi self-Attention 和 Feed Forward 层之前进行 Layer Norm 
+    '''
     def __init__(self, n_ctx, config, scale=False):
         super().__init__()
         hidden_size = config.n_embd
@@ -300,6 +348,16 @@ class Block(nn.Module):
             use_cache=False,
             output_attentions=False,
     ):
+        '''
+        hidden_states:          (batch_size, 3*seq_length, hidden_size)
+        attention_mask:         (batch_size, 1, 1, 3*seq_length)
+        layer_past:             None
+        head_mask:              None
+        encoder_hidden_states:  None    (DT 没有 encoder 部分)
+        encoder_attention_mask: None    (DT 没有 encoder 部分)
+        output_attentions:      False   (这个应该是 encoder 输出来做 cross attn 的)
+        '''
+        # Layer Norm + Multi self-Attention
         attn_outputs = self.attn(
             self.ln_1(hidden_states),
             layer_past=layer_past,
@@ -307,12 +365,14 @@ class Block(nn.Module):
             head_mask=head_mask,
             use_cache=use_cache,
             output_attentions=output_attentions,
-        )
-        attn_output = attn_outputs[0]  # output_attn: a, present, (attentions)
-        outputs = attn_outputs[1:]
+        )                               # attn_outputs: a, present, (attentions)
+        attn_output = attn_outputs[0]   # (batch_size, 3*seq_length, hidden_size)
+        outputs = attn_outputs[1:]      # [present, ]   (present是stack的key和value)
+        
         # residual connection
         hidden_states = attn_output + hidden_states
 
+        assert encoder_hidden_states is None    # DT 中没有 encoder
         if encoder_hidden_states is not None:
             # add one self-attention block for cross-attention
             assert hasattr(
@@ -331,7 +391,9 @@ class Block(nn.Module):
             hidden_states = hidden_states + attn_output
             outputs = outputs + cross_attn_outputs[2:]  # add cross attentions if we output attention weights
 
+        # Layer Norm + FFD
         feed_forward_hidden_states = self.mlp(self.ln_2(hidden_states))
+        
         # residual connection
         hidden_states = hidden_states + feed_forward_hidden_states
         # hidden_states = hidden_states + self.adapter_ln(self.adapter_mlp(hidden_states))
@@ -381,8 +443,7 @@ class GPT2DoubleHeadsModelOutput(ModelOutput):
         mc_logits (:obj:`torch.FloatTensor` of shape :obj:`(batch_size, num_choices)`):
             Prediction scores of the multiple choice classification head (scores for each choice before SoftMax).
         past_key_values (:obj:`List[torch.FloatTensor]`, `optional`, returned when ``use_cache=True`` is passed or when ``config.use_cache=True``):
-            List of :obj:`torch.FloatTensor` of length :obj:`config.n_layers`, with each tensor of shape :obj:`(2,
-            batch_size, num_heads, sequence_length, embed_size_per_head)`).
+            List of :obj:`torch.FloatTensor` of length :obj:`config.n_layers`, with each tensor of shape :obj:`(2,batch_size, num_heads, sequence_length, embed_size_per_head)`).
             Contains pre-computed hidden-states (key and values in the attention blocks) that can be used (see
             :obj:`past_key_values` input) to speed up sequential decoding.
         hidden_states (:obj:`tuple(torch.FloatTensor)`, `optional`, returned when ``output_hidden_states=True`` is passed or when ``config.output_hidden_states=True``):
@@ -418,7 +479,6 @@ GPT2_START_DOCSTRING = r"""
             configuration. Check out the :meth:`~transformers.PreTrainedModel.from_pretrained` method to load the model
             weights.
 """
-
 GPT2_INPUTS_DOCSTRING = r"""
     Args:
         input_ids (:obj:`torch.LongTensor` of shape :obj:`(batch_size, input_ids_length)`):
@@ -591,27 +651,34 @@ class GPT2Model(GPT2PreTrainedModel):
     )
     def forward(
             self,
-            input_ids=None,
-            past_key_values=None,
-            attention_mask=None,
-            token_type_ids=None,
-            position_ids=None,
-            head_mask=None,
-            inputs_embeds=None,
-            encoder_hidden_states=None,
-            encoder_attention_mask=None,
-            use_cache=None,
-            output_attentions=None,
-            output_hidden_states=None,
-            return_dict=None,
+            attention_mask=None,            # GPT 的原始序列输入的 attn mask，这个 mask 主要用来遮盖 padding 部分
+            input_ids=None,                 # GPT 的原始序列输入（应该是词表索引形式）input_ids 和 inputs_embeds 有且只有一个不为 None
+            inputs_embeds=None,             # GPT 的原始序列输入（嵌入向量形式）input_ids 和 inputs_embeds 有且只有一个不为 None
+            token_type_ids=None,            # 若非 None，是尺寸为 (batch_size, input_ids_length) 的 0/1 tensor, 用来区分输入序列中连接的两个句子
+            position_ids=None,              # 若非 None，是尺寸为 (batch_size, sequence_length) 的 tensor，是位置嵌入中每个输入序列符号的位置索引
+            head_mask=None,                 # 若非 None，是尺寸为 (num_layers, num_heads) 的 0/1 tensor, 用来遮盖失能一些选定的注意力头（0位置）
+            use_cache=None,                 # Whether or not the model should return the last key/values attentions (not used by all models).
+            output_attentions=None,         # Whether or not the model should returns all attentions.
+            output_hidden_states=None,      # Whether or not the model should return all hidden-states.
+            return_dict=None,               # Whether or not the model should return a :class:`~transformers.file_utils.ModelOutput` instead of a plain tuple.
+            past_key_values=None,           # 当 use_cache = True 时，返回长度为 config.n_layers 的 FloatTensor 列表，
+                                            # 每个张量的形状为 (2, batch_size, num_heads, sequence_length, embed_size_per_head)
+                                            # 包含预先计算的隐藏状态（注意力块中的键和值），可用于加速顺序解码
+            encoder_hidden_states=None,     # 当 output_hidden_states=True 时，返回 (batch_size, sequence_length, hidden_size, 2) 尺寸的 float tensor，
+                                            # 每个元组包含编码器在每层输出处的隐藏状态和初始嵌入输出。
+            encoder_attention_mask=None,    # 编码器 attention mask
     ):
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        use_cache = use_cache if use_cache is not None else self.config.use_cache
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        '''
+        inputs_embeds:  (batch_size, 3*seq_length, hidden_size)
+        attention_mask: (batch_size, 3*seq_length, )
+        '''
+        # 行为控制
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions               # False
+        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states   # False
+        use_cache = use_cache if use_cache is not None else self.config.use_cache                                               # True
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict                                   # True
 
+        # 从原始输入中获取 input_shape 和 batch_size
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
         elif input_ids is not None:
@@ -619,47 +686,46 @@ class GPT2Model(GPT2PreTrainedModel):
             input_ids = input_ids.view(-1, input_shape[-1])
             batch_size = input_ids.shape[0]
         elif inputs_embeds is not None:
-            input_shape = inputs_embeds.size()[:-1]
+            input_shape = inputs_embeds.size()[:-1] # (batch_size, 3*seq_length,)
             batch_size = inputs_embeds.shape[0]
         else:
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
-        if token_type_ids is not None:
-            token_type_ids = token_type_ids.view(-1, input_shape[-1])
-        if position_ids is not None:
-            position_ids = position_ids.view(-1, input_shape[-1])
-
+        # DT 里 past_key_values 也没用到，设为 [None]*len(self.h)
         if past_key_values is None:
             past_length = 0
             past_key_values = [None] * len(self.h)
         else:
             past_length = past_key_values[0][0].size(-2)
-        if position_ids is None:
+
+        # 这两个在 DT 都没用到
+        if token_type_ids is not None:
+            token_type_ids = token_type_ids.view(-1, input_shape[-1])
+        
+        # 这一段 DT 也没用到，应该是 GPT 用来计算 position embadding 用的
+        if position_ids is not None:
+            position_ids = position_ids.view(-1, input_shape[-1])
+        else:
             device = input_ids.device if input_ids is not None else inputs_embeds.device
             position_ids = torch.arange(past_length, input_shape[-1] + past_length, dtype=torch.long, device=device)
             position_ids = position_ids.unsqueeze(0).view(-1, input_shape[-1])
 
-        # Attention mask.
+        # Attention mask. 这个 mask 主要用来遮盖 padding 部分
         if attention_mask is not None:
             assert batch_size > 0, "batch_size has to be defined and > 0"
             attention_mask = attention_mask.view(batch_size, -1)
             # We create a 3D attention mask from a 2D tensor mask.
-            # Sizes are [batch_size, 1, 1, to_seq_length]
-            # So we can broadcast to [batch_size, num_heads, from_seq_length, to_seq_length]
-            # this attention mask is more simple than the triangular masking of causal attention
-            # used in OpenAI GPT, we just need to prepare the broadcast dimension here.
+            # Sizes are [batch_size, 1, 1, to_seq_length], so we can broadcast to [batch_size, num_heads, from_seq_length, to_seq_length]
+            # this attention mask is more simple than the triangular masking of causal attentionz used in OpenAI GPT, we just need to prepare the broadcast dimension here.
             attention_mask = attention_mask[:, None, None, :]
 
-            # Since attention_mask is 1.0 for positions we want to attend and 0.0 for
-            # masked positions, this operation will create a tensor which is 0.0 for
-            # positions we want to attend and -10000.0 for masked positions.
-            # Since we are adding it to the raw scores before the softmax, this is
-            # effectively the same as removing these entirely.
+            # Note that attention_mask is 1.0 for positions we want to attend and 0.0 for masked positions
             attention_mask = attention_mask.to(dtype=self.dtype)  # fp16 compatibility
             attention_mask = (1.0 - attention_mask) * -10000.0
 
+        # 这部分涉及 cross_attention，在 DT 也没用上
         # If a 2D ou 3D attention mask is provided for the cross-attention
-        # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
+        # we need to make broadcastable to [batch_size, n_heads, seq_length, seq_length]
         if self.config.add_cross_attention and encoder_hidden_states is not None:
             encoder_batch_size, encoder_sequence_length, _ = encoder_hidden_states.size()
             encoder_hidden_shape = (encoder_batch_size, encoder_sequence_length)
@@ -669,31 +735,35 @@ class GPT2Model(GPT2PreTrainedModel):
         else:
             encoder_attention_mask = None
 
-        # Prepare head mask if needed
-        # 1.0 in head_mask indicate we keep the head
-        # attention_probs has shape bsz x n_heads x N x N
-        # head_mask has shape n_layer x batch x n_heads x N x N
-        head_mask = self.get_head_mask(head_mask, self.config.n_layer)
+        # 这部分涉是设置注意力头 mask，在 DT 也没用上
+        # Prepare head mask if needed（1.0 in head_mask indicate we keep the head）
+        # attention_probs shape:(batch_size, n_heads, seq_length, seq_length)
+        # head_mask shape:      (n_layer, batch_size, n_heads, seq_length, seq_length)
+        head_mask = self.get_head_mask(head_mask, self.config.n_layer)  # [None, None, None] for DT
 
+        # 如果输入不是 inputs_embeds 形式而是 inputs_inds 形式，用 wte 做词向量嵌入，DT 没用这个
+        '''
         if inputs_embeds is None:
             inputs_embeds = self.wte(input_ids)
-        # position_embeds = self.wpe(position_ids)
-        hidden_states = inputs_embeds  # + position_embeds
+        position_embeds = self.wpe(position_ids) 
+        hidden_states = inputs_embeds + position_embeds
+        '''
+        assert inputs_embeds is not None    # DT 预处理时直接拿到了轨迹各个 token 的嵌入，应当满足这个
+        hidden_states = inputs_embeds
 
+        assert token_type_ids is None       # token 所属句子的嵌入(比如BERT上下句任务会用)，DT 没用这个
         if token_type_ids is not None:
             token_type_embeds = self.wte(token_type_ids)
             hidden_states = hidden_states + token_type_embeds
 
         hidden_states = self.drop(hidden_states)
-
-        output_shape = input_shape + (hidden_states.size(-1),)
+        output_shape = input_shape + (hidden_states.size(-1),)  # (batch_size, 3*seq_length, hidden_size)
 
         presents = () if use_cache else None
         all_self_attentions = () if output_attentions else None
         all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
         all_hidden_states = () if output_hidden_states else None
         for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
-
             if self.use_layers is not None and i >= self.use_layers:
                 break
 
@@ -701,18 +771,25 @@ class GPT2Model(GPT2PreTrainedModel):
             if self.model_parallel:
                 torch.cuda.set_device(hidden_states.device)
                 # Ensure layer_past is on same device as hidden_states (might not be correct)
+                assert layer_past is None   # for DT
                 if layer_past is not None:
                     layer_past = layer_past.to(hidden_states.device)
+                
                 # Ensure that attention_mask is always on the same device as hidden_states
                 if attention_mask is not None:
                     attention_mask = attention_mask.to(hidden_states.device)
+                
+                # Ensure that head_mask is always on the same device as hidden_states
+                assert head_mask == [None] * self.config.n_layer    # for DT
                 if isinstance(head_mask, torch.Tensor):
                     head_mask = head_mask.to(hidden_states.device)
+            
+            assert output_hidden_states == False    # 这个应该是 Encoder 输出来作 cross attn 的，DT 不需要
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
             if getattr(self.config, "gradient_checkpointing", False):
-
+                # 使用 gradient_checkpointing，以降低后向传递的速度为代价来节省内存
                 def create_custom_forward(module):
                     def custom_forward(*inputs):
                         # checkpointing only works with tuple returns, not with lists
@@ -730,6 +807,7 @@ class GPT2Model(GPT2PreTrainedModel):
                     encoder_attention_mask,
                 )
             else:
+                # DT 走这边
                 outputs = block(
                     hidden_states,
                     layer_past=layer_past,
@@ -739,26 +817,31 @@ class GPT2Model(GPT2PreTrainedModel):
                     encoder_attention_mask=encoder_attention_mask,
                     use_cache=use_cache,
                     output_attentions=output_attentions,
-                )
+                )   # outputs: hidden_states, present, (attentions, cross_attentions)
 
-            hidden_states, present = outputs[:2]
+            hidden_states, present = outputs[:2]    # hidden_states: (batch_size, 3*seq_length, hidden_size)
             if use_cache is True:
                 presents = presents + (present,)
 
+            assert output_attentions == False   # for DT
             if output_attentions:
                 all_self_attentions = all_self_attentions + (outputs[2],)
                 if self.config.add_cross_attention:
                     all_cross_attentions = all_cross_attentions + (outputs[3],)
 
             # Model Parallel: If it's the last layer for that device, put things on the next device
+            assert self.model_parallel == False   # 没有多卡
             if self.model_parallel:
                 for k, v in self.device_map.items():
                     if i == v[-1] and "cuda:" + str(k) != self.last_device:
                         hidden_states = hidden_states.to("cuda:" + str(k + 1))
 
-        hidden_states = self.ln_f(hidden_states)
+        # 所有 transformer decoder 后的 Layer Norm
+        hidden_states = self.ln_f(hidden_states)            # (batch_size, 3*seq_length, hidden_size)
 
-        hidden_states = hidden_states.view(*output_shape)
+        # 至此 GPT2 结构全部跑完
+        hidden_states = hidden_states.view(*output_shape)   # (batch_size, 3*seq_length, hidden_size)
+
         # Add last hidden state
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
@@ -766,6 +849,7 @@ class GPT2Model(GPT2PreTrainedModel):
         if not return_dict:
             return tuple(v for v in [hidden_states, presents, all_hidden_states, all_self_attentions] if v is not None)
 
+        # 返回 GPT2 输出 last_hidden_state 和其他中间参数
         return BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
             past_key_values=presents,
