@@ -28,7 +28,8 @@ def experiment(exp_prefix:str, variant:dict,):
     model_type = variant['model_type']
     log_to_wandb = variant.get('log_to_wandb', False)
     env_name, dataset = variant['env'], variant['dataset']
-    
+    extra_name = variant['extra_name']
+
     # 环境、训练、测试参数
     if env_name == 'hopper':
         env = gym.make('Hopper-v3')
@@ -64,7 +65,7 @@ def experiment(exp_prefix:str, variant:dict,):
     num_eval_episodes = variant['num_eval_episodes']
 
     # load dataset
-    dataset_path = f'/home/tim/桌面/git/decision-transformer/gym/data/{env_name}-{dataset}-v2.pkl'
+    dataset_path = f'/home/tim/桌面/git/decision-transformer/gym/data/{env_name}-{dataset}-v2{extra_name}.pkl'
     with open(dataset_path, 'rb') as f:
         trajectories = pickle.load(f)
     '''
@@ -209,9 +210,9 @@ def experiment(exp_prefix:str, variant:dict,):
             }
         return fn
 
-    group_name = f'{exp_prefix}-{env_name}-{dataset}' 
+    group_name = f'{exp_prefix}-{env_name}-{dataset}({extra_name})' 
     for seed in [42, 43, 44]:
-
+    #for seed in [43, 44]:
         # 模型对象
         if model_type == 'dt':
             model = DecisionTransformer(
@@ -305,9 +306,11 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
     # 环境名
-    parser.add_argument('--env', type=str, default='walker2d')
+    parser.add_argument('--env', type=str, default='hopper')
     # 数据质量（medium, medium-replay, medium-expert, expert）
-    parser.add_argument('--dataset', type=str, default='expert') 
+    parser.add_argument('--dataset', type=str, default='medium') 
+    # 数据质量（medium, medium-replay, medium-expert, expert）
+    parser.add_argument('--extra_name', type=str, default='(BOt10)') 
     # 是否使用延时reward（normal for standard setting, delayed for sparse）
     parser.add_argument('--mode', type=str, default='normal')
     # state、action 和 rtg 序列的 context 长度，如果长度不足则分别 pad 至这个长度

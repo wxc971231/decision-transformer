@@ -133,5 +133,7 @@ dmypy.json
 /atari/dqn_replay/*
 /atari/ROMS/*
 /gym/data/*
+/gym/PredNet/data/*
+/gym/PredNet/ckpt/*
 ./test.py
 test.ipynb
